@@ -1,25 +1,17 @@
-//! XML extractor for axum
-//!
-//! This crate provides struct `Xml` that can be used to extract typed information from request's body.
-//!
-//! Under the hood, [quick-xml](https://github.com/tafia/quick-xml) is used to parse payloads.
-//!
-//! ## Features
-//!
-//! - `encoding`: support non utf-8 payload
-#![allow(clippy::module_name_repetitions)]
-
-use std::ops::{Deref, DerefMut};
-
-use async_trait::async_trait;
-use axum_core::extract::{FromRequest, RequestParts};
-use axum_core::response::{IntoResponse, Response};
-use axum_core::BoxError;
+use axum_core::{
+    extract::{FromRequest},
+    BoxError,
+};
 use bytes::Bytes;
-use http::{header, HeaderValue, StatusCode};
 use http_body::Body as HttpBody;
-use serde::de::DeserializeOwned;
-use serde::Serialize;
+use async_trait::async_trait;
+use axum_core::response::{IntoResponse, Response};
+use http::{
+    header::{self, HeaderMap, HeaderValue},
+    Request, StatusCode,
+};
+use serde::{de::DeserializeOwned, Serialize};
+use std::ops::{Deref, DerefMut};
 
 use crate::rejection::XmlRejection;
 
@@ -30,9 +22,22 @@ mod tests;
 /// XML Extractor / Response.
 ///
 /// When used as an extractor, it can deserialize request bodies into some type that
-/// implements [`serde::Deserialize`]. If the request body cannot be parsed, or it does not contain
-/// the `Content-Type: application/xml` header, it will reject the request and return a
-/// `400 Bad Request` response.
+/// implements [`serde::Deserialize`]. The request will be rejected (and a [`XmlRejection`] will
+/// be returned) if:
+///
+/// - The request doesn't have a `Content-Type: application/xml` (or similar) header.
+/// - The body doesn't contain syntactically valid XML.
+/// - The body contains syntactically valid XML but it couldn't be deserialized into the target
+/// type.
+/// - Buffering the request body fails.
+///
+/// Since parsing XML requires consuming the request body, the `Xml` extractor must be
+/// *last* if there are multiple extractors in a handler.
+/// See ["the order of extractors"][order-of-extractors]
+///
+/// [order-of-extractors]: crate::extract#the-order-of-extractors
+///
+/// See [`XmlRejection`] for more details.
 ///
 /// # Extractor example
 ///
@@ -43,7 +48,7 @@ mod tests;
 ///     Router,
 /// };
 /// use serde::Deserialize;
-/// use axum_xml::Xml;
+/// use rustcms_axum_xml::Xml;
 ///
 /// #[derive(Deserialize)]
 /// struct CreateUser {
@@ -74,7 +79,7 @@ mod tests;
 /// };
 /// use serde::Serialize;
 /// use uuid::Uuid;
-/// use axum_xml::Xml;
+/// use rustcms_axum_xml::Xml;
 ///
 /// #[derive(Serialize)]
 /// struct User {
@@ -82,7 +87,7 @@ mod tests;
 ///     username: String,
 /// }
 ///
-/// async fn get_user(Path(user_id) : Path<Uuid>) -> Xml<User> {
+/// async fn get_user(Path(user_id) : Path<Uuid>) -> Json<User> {
 ///     let user = find_user(user_id).await;
 ///     Xml(user)
 /// }
@@ -101,18 +106,20 @@ mod tests;
 pub struct Xml<T>(pub T);
 
 #[async_trait]
-impl<T, B> FromRequest<B> for Xml<T>
+impl<T, S, B> FromRequest<S, B> for Xml<T>
 where
     T: DeserializeOwned,
-    B: HttpBody + Send,
+    B: HttpBody + Send + 'static,
     B::Data: Send,
     B::Error: Into<BoxError>,
+    S: Send + Sync,
 {
     type Rejection = XmlRejection;
 
-    async fn from_request(req: &mut RequestParts<B>) -> Result<Self, Self::Rejection> {
-        if xml_content_type(req) {
-            let bytes = Bytes::from_request(req).await?;
+    async fn from_request(req: Request<B>, state: &S) -> Result<Self, Self::Rejection> {
+
+        if xml_content_type(req.headers()) {
+            let bytes = Bytes::from_request(req, state).await?;
 
             let value = quick_xml::de::from_reader(&*bytes)?;
 
@@ -120,11 +127,12 @@ where
         } else {
             Err(XmlRejection::MissingXMLContentType)
         }
+
     }
 }
 
-fn xml_content_type<B>(req: &RequestParts<B>) -> bool {
-    let content_type = if let Some(content_type) = req.headers().get(header::CONTENT_TYPE) {
+fn xml_content_type(headers: &HeaderMap) -> bool {
+    let content_type = if let Some(content_type) = headers.get(header::CONTENT_TYPE) {
         content_type
     } else {
         return false;
@@ -142,7 +150,7 @@ fn xml_content_type<B>(req: &RequestParts<B>) -> bool {
         return false;
     };
 
-    let is_xml_content_type = (mime.type_() == "application" || mime.type_() == "text")
+    let is_xml_content_type =  (mime.type_() == "application" || mime.type_() == "text")
         && (mime.subtype() == "xml" || mime.suffix().map_or(false, |name| name == "xml"));
 
     is_xml_content_type
